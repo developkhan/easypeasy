@@ -1,7 +1,5 @@
 <?php
 
-
-
 $configFile = __DIR__ . '/config.json';
 $sentFile = __DIR__ . '/sent_messages.json';
 
@@ -15,7 +13,7 @@ if (!$config) {
 }
 
 $sourceChannels = $config['source_channels'] ?? [];
-$targetChannels = $config['target_channels'] ?? []; // تغییر این خط: حالا آرایه
+$targetChannels = $config['target_channels'] ?? [];
 $botToken = $config['bot_token'] ?? '';
 $footerText = $config['footer_text'] ?? '';
 
@@ -29,7 +27,7 @@ if (file_exists($sentFile)) {
     $sentMessages = json_decode(file_get_contents($sentFile), true) ?: [];
 }
 
-// تابع پاکسازی متن (حذف لینک‌ها و آیدی‌ها)
+// پاکسازی متن (حذف آیدی‌ها و فاصله‌های اضافی)
 function cleanText($text) {
     $text = preg_replace('/<a[^>]*>(.*?)<\/a>/is', '$1', $text);
     $text = preg_replace('/@\w+/u', '', $text);
@@ -50,68 +48,158 @@ function fixUrl($url) {
     return $url;
 }
 
+// تبدیل محتوای پست به متن HTML امن برای تلگرام
+// ایموجی‌های پرمیوم حذف می‌شوند و ایموجی‌های معمولی می‌مانند
+function nodeToText($node) {
+    $out = '';
+    $allowed = ['b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'code', 'pre'];
+    foreach ($node->childNodes as $child) {
+        if ($child->nodeType === XML_TEXT_NODE) {
+            $out .= htmlspecialchars($child->nodeValue, ENT_NOQUOTES, 'UTF-8');
+            continue;
+        }
+        if ($child->nodeType !== XML_ELEMENT_NODE) {
+            continue;
+        }
+        $name = strtolower($child->nodeName);
+        $class = strtolower($child->getAttribute('class'));
+
+        if ($name === 'br') {
+            $out .= "\n";
+            continue;
+        }
+
+        // ایموجی پرمیوم (سفارشی): حذف کامل
+        if ($name === 'tg-emoji'
+            || $child->hasAttribute('emoji-id')
+            || $child->hasAttribute('data-custom-emoji-id')
+            || strpos($class, 'custom') !== false) {
+            continue;
+        }
+
+        // ایموجی معمولی: فقط خود کاراکتر ایموجی
+        if ($name === 'i' && strpos($class, 'emoji') !== false) {
+            $out .= htmlspecialchars($child->textContent, ENT_NOQUOTES, 'UTF-8');
+            continue;
+        }
+
+        $inner = nodeToText($child);
+        if (in_array($name, $allowed, true)) {
+            if (trim($inner) !== '') {
+                $out .= "<$name>" . $inner . "</$name>";
+            }
+        } else {
+            $out .= $inner;
+        }
+    }
+    return $out;
+}
+
 function getLastTelegramPost($channelId) {
     $url = "https://t.me/s/$channelId";
 
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, $url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
     curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0');
     $html = curl_exec($ch);
     curl_close($ch);
 
-    if (!$html) return null;
+    if (!$html) {
+        error_log("دریافت صفحه کانال $channelId ناموفق بود.");
+        return null;
+    }
 
-    preg_match_all('/<div class="tgme_widget_message_wrap js-widget_message_wrap".*?<\/div>\s*<\/div>/s', $html, $messages);
-    if (empty($messages[0])) return null;
+    libxml_use_internal_errors(true);
+    $dom = new DOMDocument();
+    $dom->loadHTML('<?xml encoding="UTF-8">' . $html);
+    libxml_clear_errors();
+    $xp = new DOMXPath($dom);
 
-    $last = end($messages[0]);
+    $wraps = $xp->query("//div[contains(@class,'tgme_widget_message_wrap')]");
+    if ($wraps === false || $wraps->length === 0) {
+        error_log("هیچ پستی در صفحه کانال $channelId پیدا نشد (کانال باید عمومی باشد).");
+        return null;
+    }
+    $wrap = $wraps->item($wraps->length - 1);
 
-    preg_match('/<div class="tgme_widget_message_text js-message_text"[^>]*>(.*?)<\/div>/s', $last, $textMatch);
-    $rawHtml = $textMatch[1] ?? '';
+    // شناسه پست
+    $postId = '';
+    $msgNode = $xp->query(".//div[@data-post]", $wrap)->item(0);
+    if ($msgNode) {
+        $postId = $msgNode->getAttribute('data-post');
+    }
 
-    $rawHtml = str_ireplace(['<br>', '<br/>', '<br />'], "\n", $rawHtml);
+    // زمان پست
+    $datetime = '';
+    $timeNode = $xp->query(".//time[@datetime]", $wrap)->item(0);
+    if ($timeNode) {
+        $datetime = $timeNode->getAttribute('datetime');
+    }
 
-    // حذف ایموجی‌های پرمیوم (سفارشی)
-    $rawHtml = preg_replace('#<tg-emoji\b[^>]*>.*?</tg-emoji>#is', '', $rawHtml);
-    $rawHtml = preg_replace('#<i\b[^>]*custom[^>]*>.*?</i>#is', '', $rawHtml);
-    // ایموجی‌های معمولی: <i class="emoji"><b>😀</b></i> فقط خود ایموجی بماند
-    $rawHtml = preg_replace('#<i\b[^>]*class="emoji[^"]*"[^>]*>\s*<b>(.*?)</b>\s*</i>#is', '$1', $rawHtml);
+    // متن
+    $finalText = '';
+    $textNode = $xp->query(".//div[contains(@class,'js-message_text')]", $wrap)->item(0);
+    if ($textNode) {
+        $finalText = nodeToText($textNode);
+    }
 
-    $allowedTags = '<b><strong><i><em><u><s><strike><del><a><code><pre>';
-    $cleanHtml = strip_tags($rawHtml, $allowedTags);
-    // حذف ویژگی‌های اضافی تگ‌ها و تگ‌های خالی
-    $cleanHtml = preg_replace('#<(b|strong|i|em|u|s|strike|del|code|pre)\b[^>]*>#i', '<$1>', $cleanHtml);
-    $cleanHtml = preg_replace('#<(b|strong|i|em|u|s|strike|del|code|pre)>\s*</\1>#i', '', $cleanHtml);
-    $finalText = html_entity_decode($cleanHtml, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-
-    // آدرس عکس فقط از داخل خود تگ عکس پست خوانده می‌شود (نه از ایموجی‌ها)
+    // عکس: فقط از تگ عکس خود پست
     $photoUrl = null;
-    if (preg_match('/<a\b[^>]*tgme_widget_message_photo_wrap[^>]*>/s', $last, $aTag)) {
-        if (preg_match('/background-image:\s*url\(([^)]+)\)/i', $aTag[0], $pm)) {
-            $photoUrl = $pm[1];
+    $photoNode = $xp->query(".//a[contains(@class,'tgme_widget_message_photo_wrap')]", $wrap)->item(0);
+    if ($photoNode) {
+        $style = $photoNode->getAttribute('style');
+        if (preg_match('/background-image:\s*url\(([^)]+)\)/i', $style, $pm)) {
+            $photoUrl = fixUrl($pm[1]);
         }
     }
     if ($photoUrl && stripos($photoUrl, 'img/emoji') !== false) {
         $photoUrl = null;
     }
 
-    preg_match('/<video[^>]+src="([^"]+)"/', $last, $videoMatch);
-    $videoUrl = $videoMatch[1] ?? null;
+    // ویدیو
+    $videoUrl = null;
+    $videoNode = $xp->query(".//video[@src]", $wrap)->item(0);
+    if ($videoNode) {
+        $videoUrl = fixUrl($videoNode->getAttribute('src'));
+    }
 
-    $photoUrl = fixUrl($photoUrl);
-    $videoUrl = fixUrl($videoUrl);
-
-    preg_match('/<time datetime="([^"]+)"[^>]*>([^<]+)<\/time>/', $last, $timeMatch);
-    $datetime = $timeMatch[1] ?? null;
+    error_log("[$channelId] پست: $postId | طول متن: " . mb_strlen($finalText)
+        . " | عکس: " . ($photoUrl ? 'دارد' : 'ندارد')
+        . " | ویدیو: " . ($videoUrl ? 'دارد' : 'ندارد'));
 
     return [
         'text' => $finalText,
         'datetime' => $datetime,
+        'postId' => $postId,
         'channelId' => $channelId,
         'photo' => $photoUrl,
         'video' => $videoUrl,
     ];
+}
+
+// دانلود فایل روی سرور و ارسال به‌صورت آپلود (مطمئن‌تر از ارسال با لینک)
+function downloadFile($url) {
+    $tmp = tempnam(sys_get_temp_dir(), 'tg');
+    $fp = fopen($tmp, 'wb');
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_FILE, $fp);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0');
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 15);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 90);
+    $ok = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    fclose($fp);
+    if (!$ok || $code >= 400 || filesize($tmp) < 100) {
+        error_log("دانلود فایل ناموفق بود (کد $code).");
+        @unlink($tmp);
+        return null;
+    }
+    return $tmp;
 }
 
 function sendToTelegram($botToken, $chatId, $text, $photo = null, $video = null, $footerText = '') {
@@ -122,13 +210,11 @@ function sendToTelegram($botToken, $chatId, $text, $photo = null, $video = null,
     if ($hasMedia && mb_strlen($clean . "\n\n" . $footerText) > 1000) {
         $ok1 = sendOnce($botToken, $chatId, '', $photo, $video, '');
         $ok2 = sendOnce($botToken, $chatId, $clean, null, null, $footerText);
-        if ($ok1 || $ok2) return true;
-        return false;
+        return $ok1 || $ok2;
     }
 
     $ok = sendOnce($botToken, $chatId, $clean, $photo, $video, $footerText);
     if (!$ok && $hasMedia) {
-        // اگر ارسال با عکس/ویدیو شکست خورد، فقط متن را بفرست
         error_log('ارسال رسانه ناموفق بود، ارسال به‌صورت متن...');
         $ok = sendOnce($botToken, $chatId, $clean, null, null, $footerText);
     }
@@ -143,24 +229,34 @@ function sendOnce($botToken, $chatId, $text, $photo = null, $video = null, $foot
         $text = ($text !== '') ? $text . "\n\n" . $footer : $footer;
     }
 
-    if ($video) {
-        $url = "https://api.telegram.org/bot$botToken/sendVideo";
+    $tmpFile = null;
+
+    if ($video || $photo) {
+        $isVideo = !empty($video);
+        $src = $isVideo ? $video : $photo;
+        $method = $isVideo ? 'sendVideo' : 'sendPhoto';
+        $field = $isVideo ? 'video' : 'photo';
+
+        $tmpFile = downloadFile($src);
         $data = [
             'chat_id' => "@$chatId",
-            'video' => $video,
             'caption' => $text,
             'parse_mode' => 'HTML',
         ];
-    } elseif ($photo) {
-        $url = "https://api.telegram.org/bot$botToken/sendPhoto";
-        $data = [
-            'chat_id' => "@$chatId",
-            'photo' => $photo,
-            'caption' => $text,
-            'parse_mode' => 'HTML',
-        ];
+        if ($tmpFile) {
+            $data[$field] = new CURLFile(
+                $tmpFile,
+                $isVideo ? 'video/mp4' : 'image/jpeg',
+                $isVideo ? 'video.mp4' : 'photo.jpg'
+            );
+        } else {
+            $data[$field] = $src;
+        }
+        if ($isVideo) {
+            $data['supports_streaming'] = 'true';
+        }
     } else {
-        $url = "https://api.telegram.org/bot$botToken/sendMessage";
+        $method = 'sendMessage';
         $data = [
             'chat_id' => "@$chatId",
             'text' => $text,
@@ -168,11 +264,14 @@ function sendOnce($botToken, $chatId, $text, $photo = null, $video = null, $foot
         ];
     }
 
+    $url = "https://api.telegram.org/bot$botToken/$method";
+
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, $url);
     curl_setopt($ch, CURLOPT_POST, true);
     curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 120);
     $response = curl_exec($ch);
 
     if ($response === false) {
@@ -180,14 +279,18 @@ function sendOnce($botToken, $chatId, $text, $photo = null, $video = null, $foot
     }
     curl_close($ch);
 
+    if ($tmpFile) {
+        @unlink($tmpFile);
+    }
+
     $res = json_decode($response, true);
-    if (!$res || !$res['ok']) {
+    if (!$res || empty($res['ok'])) {
         error_log('Telegram API error: ' . $response);
     }
     return $res && isset($res['ok']) && $res['ok'] === true;
 }
 
-// حلقه بررسی و ارسال پیام‌ها
+// حلقه بررسی و ارسال پست‌ها
 $updated = false;
 
 foreach ($sourceChannels as $source) {
@@ -196,12 +299,17 @@ foreach ($sourceChannels as $source) {
         continue;
     }
 
-    $messageId = md5($post['channelId'] . '|' . $post['datetime']);
+    if ($post['text'] === '' && empty($post['photo']) && empty($post['video'])) {
+        error_log("[$source] پست بدون متن و رسانه، نادیده گرفته شد.");
+        continue;
+    }
+
+    $key = $post['postId'] !== '' ? $post['postId'] : $post['datetime'];
+    $messageId = md5($post['channelId'] . '|' . $key);
     if (in_array($messageId, $sentMessages)) {
         continue;
     }
 
-    // ارسال به همه کانال‌های مقصد
     $anySent = false;
     foreach ($targetChannels as $target) {
         $sent = sendToTelegram($botToken, $target, $post['text'], $post['photo'], $post['video'], $footerText);
@@ -221,5 +329,3 @@ foreach ($sourceChannels as $source) {
 if ($updated) {
     file_put_contents($sentFile, json_encode($sentMessages, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 }
-
-
