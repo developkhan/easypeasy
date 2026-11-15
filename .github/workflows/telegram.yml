@@ -1,0 +1,57 @@
+name: telegram-copy
+
+on:
+  schedule:
+    # هر ۵ دقیقه (ریپوی Public: دقیقه‌ها رایگان است)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:   # دکمه اجرای دستی
+
+permissions:
+  contents: write
+
+concurrency:
+  group: telegram-copy
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: curl, mbstring
+
+      - name: Build config.json from secrets
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          SOURCE_CHANNELS: ${{ secrets.SOURCE_CHANNELS }}
+          TARGET_CHANNELS: ${{ secrets.TARGET_CHANNELS }}
+          FOOTER_TEXT: ${{ secrets.FOOTER_TEXT }}
+        run: |
+          jq -n \
+            --arg token "$BOT_TOKEN" \
+            --arg src "$SOURCE_CHANNELS" \
+            --arg tgt "$TARGET_CHANNELS" \
+            --arg footer "$FOOTER_TEXT" \
+            '{bot_token:$token,
+              source_channels:($src|split(",")|map(gsub("[\\s@]";""))|map(select(length>0))),
+              target_channels:($tgt|split(",")|map(gsub("[\\s@]";""))|map(select(length>0))),
+              footer_text:$footer}' > config.json
+
+      - name: Run sender
+        run: php sender.php
+
+      - name: Save sent list
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add sent_messages.json
+          if ! git diff --cached --quiet; then
+            git commit -m "update sent messages"
+            git pull --rebase -X theirs origin main
+            git push
+          fi
