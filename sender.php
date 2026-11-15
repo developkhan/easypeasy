@@ -36,6 +36,12 @@ $linkMode = 'remove';
 
 define('LINK_MARK', "\u{E000}");
 
+// بارگذاری پیام‌های ارسال‌شده قبلی
+$sentMessages = [];
+if (file_exists($sentFile)) {
+    $sentMessages = json_decode(file_get_contents($sentFile), true) ?: [];
+}
+
 // پیدا کردن فایل تصویر جایگزین در ریپو
 function getReplacementImage($name) {
     if ($name !== '') {
