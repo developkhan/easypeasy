@@ -19,14 +19,39 @@ $footerText = $config['footer_text'] ?? '';
 $sourceChannels = array_values(array_unique($sourceChannels));
 $targetChannels = array_values(array_unique($targetChannels));
 
-if (!$botToken || empty($targetChannels) || empty($sourceChannels)) {
-    die("تنظیمات ناقص است.");
-}
+// ===== تنظیمات =====
+// نام فایل تصویر جایگزین (در ریپو، کنار sender.php)
+$replacementImageName = 'banner.png';
+// در این کانال‌های مبدأ، عکس پست با تصویر بالا عوض می‌شود (بدون @). خالی = هیچ‌کدام
+$replacePhotoChannels = [];
+// پست‌های متنی بدون عکس و ویدیو هم تصویر بالا را بگیرند
+$addImageToTextPosts = true;
+// پست‌های فوروارد شده در مبدأ کپی نشوند
+$skipForwarded = true;
+// رفتار با لینک‌ها (لینک سایت در متن یا پایین پست):
+//   'remove' = لینک و خط‌هایی که فقط لینک بوده‌اند حذف شوند، بقیه پست کپی شود
+//   'skip'   = پستی که لینک دارد اصلاً کپی نشود
+//   'keep'   = لینک‌ها دست‌نخورده بمانند
+$linkMode = 'remove';
 
-// بارگذاری پیام‌های ارسال‌شده قبلی
-$sentMessages = [];
-if (file_exists($sentFile)) {
-    $sentMessages = json_decode(file_get_contents($sentFile), true) ?: [];
+define('LINK_MARK', "\u{E000}");
+
+// پیدا کردن فایل تصویر جایگزین در ریپو
+function getReplacementImage($name) {
+    if ($name !== '') {
+        $path = __DIR__ . '/' . $name;
+        return file_exists($path) ? $path : null;
+    }
+    $files = glob(__DIR__ . '/*.{jpg,jpeg,png,webp,JPG,JPEG,PNG,WEBP}', GLOB_BRACE);
+    if (!$files) {
+        return null;
+    }
+    foreach ($files as $f) {
+        if (stripos(basename($f), 'favicon') === false) {
+            return $f;
+        }
+    }
+    return null;
 }
 
 // پاکسازی متن (حذف آیدی‌ها و فاصله‌های اضافی)
@@ -52,7 +77,8 @@ function fixUrl($url) {
 
 // تبدیل محتوای پست به متن HTML امن برای تلگرام
 // ایموجی‌های پرمیوم حذف می‌شوند و ایموجی‌های معمولی می‌مانند
-function nodeToText($node) {
+function nodeToText($node, &$hasLink = false) {
+    global $linkMode;
     $out = '';
     $allowed = ['b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'code', 'pre'];
     foreach ($node->childNodes as $child) {
@@ -79,13 +105,29 @@ function nodeToText($node) {
             continue;
         }
 
+        // لینک‌ها
+        if ($name === 'a') {
+            $href = $child->getAttribute('href');
+            $plain = trim($child->textContent);
+            $isTagOrMention = ($href === '' || $href[0] === '?' || $href[0] === '#' || mb_substr($plain, 0, 1) === '@');
+            if ($isTagOrMention || $linkMode === 'keep') {
+                $out .= nodeToText($child, $hasLink);
+            } elseif ($linkMode === 'skip') {
+                $hasLink = true;
+                $out .= nodeToText($child, $hasLink);
+            } else {
+                $out .= LINK_MARK;
+            }
+            continue;
+        }
+
         // ایموجی معمولی: فقط خود کاراکتر ایموجی
         if ($name === 'i' && strpos($class, 'emoji') !== false) {
             $out .= htmlspecialchars($child->textContent, ENT_NOQUOTES, 'UTF-8');
             continue;
         }
 
-        $inner = nodeToText($child);
+        $inner = nodeToText($child, $hasLink);
         if (in_array($name, $allowed, true)) {
             if (trim($inner) !== '') {
                 $out .= "<$name>" . $inner . "</$name>";
@@ -95,6 +137,39 @@ function nodeToText($node) {
         }
     }
     return $out;
+}
+
+// اعمال قانون لینک‌ها روی متن
+function applyLinkRules($text, &$hasLink) {
+    global $linkMode;
+    if ($linkMode === 'keep') {
+        return $text;
+    }
+    $urlPattern = '#(?:https?://|www\.|t\.me/)[^\s<]+#iu';
+    if (preg_match($urlPattern, $text)) {
+        if ($linkMode === 'skip') {
+            $hasLink = true;
+        } else {
+            $text = preg_replace($urlPattern, LINK_MARK, $text);
+        }
+    }
+    if ($linkMode !== 'remove') {
+        return $text;
+    }
+    $result = [];
+    foreach (explode("\n", $text) as $line) {
+        if (strpos($line, LINK_MARK) === false) {
+            $result[] = $line;
+            continue;
+        }
+        $rest = str_replace(LINK_MARK, '', $line);
+        $letters = preg_replace('/[^\p{L}\p{N}]+/u', '', strip_tags($rest));
+        if (mb_strlen($letters) <= 30) {
+            continue; // خط عملاً فقط لینک (یا دعوت به لینک) بوده
+        }
+        $result[] = rtrim($rest);
+    }
+    return implode("\n", $result);
 }
 
 function getLastTelegramPost($channelId) {
@@ -127,6 +202,16 @@ function getLastTelegramPost($channelId) {
     }
     $wrap = $wraps->item($wraps->length - 1);
 
+    // پست فوروارد شده: کپی نمی‌شود
+    global $skipForwarded, $linkMode;
+    if ($skipForwarded) {
+        $fw = $xp->query(".//*[contains(@class,'tgme_widget_message_forwarded_from')]", $wrap);
+        if ($fw && $fw->length > 0) {
+            error_log("[$channelId] پست فوروارد شده است و نادیده گرفته شد.");
+            return null;
+        }
+    }
+
     // شناسه پست
     $postId = '';
     $msgNode = $xp->query(".//div[@data-post]", $wrap)->item(0);
@@ -144,8 +229,14 @@ function getLastTelegramPost($channelId) {
     // متن
     $finalText = '';
     $textNode = $xp->query(".//div[contains(@class,'js-message_text')]", $wrap)->item(0);
+    $hasLink = false;
     if ($textNode) {
-        $finalText = nodeToText($textNode);
+        $finalText = nodeToText($textNode, $hasLink);
+        $finalText = applyLinkRules($finalText, $hasLink);
+    }
+    if ($linkMode === 'skip' && $hasLink) {
+        error_log("[$channelId] پست لینک دارد و نادیده گرفته شد.");
+        return null;
     }
 
     // عکس: فقط از تگ عکس خود پست
@@ -280,18 +371,20 @@ function sendOnce($botToken, $chatId, $text, $photo = null, $video = null, $foot
         $method = $isVideo ? 'sendVideo' : 'sendPhoto';
         $field = $isVideo ? 'video' : 'photo';
 
-        $tmpFile = downloadFile($src);
+        $isLocal = !preg_match('#^https?://#i', $src) && file_exists($src);
+        $tmpFile = $isLocal ? null : downloadFile($src);
+        $filePath = $isLocal ? $src : $tmpFile;
         $data = [
             'chat_id' => "@$chatId",
             'caption' => $text,
             'parse_mode' => 'HTML',
         ];
-        if ($tmpFile) {
-            $data[$field] = new CURLFile(
-                $tmpFile,
-                $isVideo ? 'video/mp4' : 'image/jpeg',
-                $isVideo ? 'video.mp4' : 'photo.jpg'
-            );
+        if ($filePath) {
+            $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+            $mimes = ['png' => 'image/png', 'webp' => 'image/webp', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg'];
+            $mime = $isVideo ? 'video/mp4' : ($mimes[$ext] ?? 'image/jpeg');
+            $fname = $isLocal ? basename($filePath) : ($isVideo ? 'video.mp4' : 'photo.jpg');
+            $data[$field] = new CURLFile($filePath, $mime, $fname);
         } else {
             $data[$field] = $src;
         }
@@ -353,9 +446,28 @@ foreach ($sourceChannels as $source) {
         continue;
     }
 
+    // جایگزینی تصویر
+    $photoToSend = $post['photo'];
+    $videoToSend = $post['video'];
+    $localImage = getReplacementImage($replacementImageName);
+    if ($localImage) {
+        $replaceList = array_map('strtolower', $replacePhotoChannels);
+        $footerLen = !empty($footerText) ? mb_strlen($footerText) + 2 : 0;
+        if ($photoToSend && !$videoToSend && in_array(strtolower($source), $replaceList, true)) {
+            $photoToSend = $localImage;
+            error_log("[$source] عکس پست با تصویر جایگزین عوض شد.");
+        } elseif ($addImageToTextPosts && !$photoToSend && !$videoToSend
+            && mb_strlen(cleanText($post['text'])) + $footerLen <= 1000) {
+            $photoToSend = $localImage;
+            error_log("[$source] تصویر جایگزین به پست متنی اضافه شد.");
+        }
+    } elseif (!empty($replacePhotoChannels) || $addImageToTextPosts) {
+        error_log('فایل تصویر جایگزین در ریپو پیدا نشد.');
+    }
+
     $anySent = false;
     foreach ($targetChannels as $target) {
-        $sent = sendToTelegram($botToken, $target, $post['text'], $post['photo'], $post['video'], $footerText);
+        $sent = sendToTelegram($botToken, $target, $post['text'], $photoToSend, $videoToSend, $footerText);
         if (!$sent) {
             error_log("خطا در ارسال پیام به کانال مقصد: @$target");
         } else {
