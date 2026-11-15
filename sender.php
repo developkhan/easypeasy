@@ -71,12 +71,30 @@ function getLastTelegramPost($channelId) {
     $rawHtml = $textMatch[1] ?? '';
 
     $rawHtml = str_ireplace(['<br>', '<br/>', '<br />'], "\n", $rawHtml);
+
+    // حذف ایموجی‌های پرمیوم (سفارشی)
+    $rawHtml = preg_replace('#<tg-emoji\b[^>]*>.*?</tg-emoji>#is', '', $rawHtml);
+    $rawHtml = preg_replace('#<i\b[^>]*custom[^>]*>.*?</i>#is', '', $rawHtml);
+    // ایموجی‌های معمولی: <i class="emoji"><b>😀</b></i> فقط خود ایموجی بماند
+    $rawHtml = preg_replace('#<i\b[^>]*class="emoji[^"]*"[^>]*>\s*<b>(.*?)</b>\s*</i>#is', '$1', $rawHtml);
+
     $allowedTags = '<b><strong><i><em><u><s><strike><del><a><code><pre>';
     $cleanHtml = strip_tags($rawHtml, $allowedTags);
+    // حذف ویژگی‌های اضافی تگ‌ها و تگ‌های خالی
+    $cleanHtml = preg_replace('#<(b|strong|i|em|u|s|strike|del|code|pre)\b[^>]*>#i', '<$1>', $cleanHtml);
+    $cleanHtml = preg_replace('#<(b|strong|i|em|u|s|strike|del|code|pre)>\s*</\1>#i', '', $cleanHtml);
     $finalText = html_entity_decode($cleanHtml, ENT_QUOTES | ENT_HTML5, 'UTF-8');
 
-    preg_match('/<a class="tgme_widget_message_photo_wrap.*?style="background-image:url\((.*?)\)"/s', $last, $photoMatch);
-    $photoUrl = $photoMatch[1] ?? null;
+    // آدرس عکس فقط از داخل خود تگ عکس پست خوانده می‌شود (نه از ایموجی‌ها)
+    $photoUrl = null;
+    if (preg_match('/<a\b[^>]*tgme_widget_message_photo_wrap[^>]*>/s', $last, $aTag)) {
+        if (preg_match('/background-image:\s*url\(([^)]+)\)/i', $aTag[0], $pm)) {
+            $photoUrl = $pm[1];
+        }
+    }
+    if ($photoUrl && stripos($photoUrl, 'img/emoji') !== false) {
+        $photoUrl = null;
+    }
 
     preg_match('/<video[^>]+src="([^"]+)"/', $last, $videoMatch);
     $videoUrl = $videoMatch[1] ?? null;
@@ -97,11 +115,22 @@ function getLastTelegramPost($channelId) {
 }
 
 function sendToTelegram($botToken, $chatId, $text, $photo = null, $video = null, $footerText = '') {
-    $ok = sendOnce($botToken, $chatId, $text, $photo, $video, $footerText);
-    if (!$ok && ($photo || $video)) {
+    $clean = cleanText($text);
+    $hasMedia = !empty($photo) || !empty($video);
+
+    // کپشن عکس/ویدیو حداکثر ۱۰۲۴ کاراکتر است
+    if ($hasMedia && mb_strlen($clean . "\n\n" . $footerText) > 1000) {
+        $ok1 = sendOnce($botToken, $chatId, '', $photo, $video, '');
+        $ok2 = sendOnce($botToken, $chatId, $clean, null, null, $footerText);
+        if ($ok1 || $ok2) return true;
+        return false;
+    }
+
+    $ok = sendOnce($botToken, $chatId, $clean, $photo, $video, $footerText);
+    if (!$ok && $hasMedia) {
         // اگر ارسال با عکس/ویدیو شکست خورد، فقط متن را بفرست
         error_log('ارسال رسانه ناموفق بود، ارسال به‌صورت متن...');
-        $ok = sendOnce($botToken, $chatId, $text, null, null, $footerText);
+        $ok = sendOnce($botToken, $chatId, $clean, null, null, $footerText);
     }
     return $ok;
 }
@@ -109,8 +138,9 @@ function sendToTelegram($botToken, $chatId, $text, $photo = null, $video = null,
 function sendOnce($botToken, $chatId, $text, $photo = null, $video = null, $footerText = '') {
     $text = cleanText($text);
 
-    if (empty($photo) && empty($video) && !empty($footerText)) {
-        $text .= "\n\n" . $footerText;
+    if (!empty($footerText)) {
+        $footer = htmlspecialchars($footerText, ENT_NOQUOTES, 'UTF-8');
+        $text = ($text !== '') ? $text . "\n\n" . $footer : $footer;
     }
 
     if ($video) {
