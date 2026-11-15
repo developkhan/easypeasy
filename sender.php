@@ -16,6 +16,8 @@ $sourceChannels = $config['source_channels'] ?? [];
 $targetChannels = $config['target_channels'] ?? [];
 $botToken = $config['bot_token'] ?? '';
 $footerText = $config['footer_text'] ?? '';
+$sourceChannels = array_values(array_unique($sourceChannels));
+$targetChannels = array_values(array_unique($targetChannels));
 
 if (!$botToken || empty($targetChannels) || empty($sourceChannels)) {
     die("تنظیمات ناقص است.");
@@ -202,21 +204,62 @@ function downloadFile($url) {
     return $tmp;
 }
 
+// کوتاه‌کردن متن HTML بدون خراب‌شدن تگ‌ها
+function truncateHtml($html, $max) {
+    if (mb_strlen($html) <= $max) {
+        return $html;
+    }
+    $cut = mb_substr($html, 0, $max - 1);
+
+    // برش از آخرین فاصله یا خط جدید
+    $p1 = mb_strrpos($cut, "\n");
+    $p2 = mb_strrpos($cut, ' ');
+    $pos = max((int)$p1, (int)$p2);
+    if ($pos > $max * 0.6) {
+        $cut = mb_substr($cut, 0, $pos);
+    }
+
+    // حذف تگ یا موجودیت نیمه‌کاره در انتها
+    $cut = preg_replace('/<[^>]*$/u', '', $cut);
+    $cut = preg_replace('/&[a-z#0-9]*$/iu', '', $cut);
+    $cut = rtrim($cut);
+
+    // بستن تگ‌های باز
+    $stack = [];
+    if (preg_match_all('#<(/?)(b|strong|i|em|u|s|strike|del|code|pre)>#i', $cut, $m, PREG_SET_ORDER)) {
+        foreach ($m as $t) {
+            $tag = strtolower($t[2]);
+            if ($t[1] === '') {
+                $stack[] = $tag;
+            } elseif (!empty($stack) && end($stack) === $tag) {
+                array_pop($stack);
+            }
+        }
+    }
+    while (!empty($stack)) {
+        $cut .= '</' . array_pop($stack) . '>';
+    }
+    return $cut . '…';
+}
+
 function sendToTelegram($botToken, $chatId, $text, $photo = null, $video = null, $footerText = '') {
-    $clean = cleanText($text);
+    $full = cleanText($text);
+    $clean = $full;
     $hasMedia = !empty($photo) || !empty($video);
 
-    // کپشن عکس/ویدیو حداکثر ۱۰۲۴ کاراکتر است
-    if ($hasMedia && mb_strlen($clean . "\n\n" . $footerText) > 1000) {
-        $ok1 = sendOnce($botToken, $chatId, '', $photo, $video, '');
-        $ok2 = sendOnce($botToken, $chatId, $clean, null, null, $footerText);
-        return $ok1 || $ok2;
+    // کپشن عکس/ویدیو حداکثر ۱۰۲۴ کاراکتر است؛ متن بلندتر کوتاه می‌شود
+    if ($hasMedia) {
+        $footerLen = !empty($footerText) ? mb_strlen($footerText) + 2 : 0;
+        $limit = 1000 - $footerLen;
+        if (mb_strlen($clean) > $limit) {
+            $clean = truncateHtml($clean, $limit);
+        }
     }
 
     $ok = sendOnce($botToken, $chatId, $clean, $photo, $video, $footerText);
     if (!$ok && $hasMedia) {
         error_log('ارسال رسانه ناموفق بود، ارسال به‌صورت متن...');
-        $ok = sendOnce($botToken, $chatId, $clean, null, null, $footerText);
+        $ok = sendOnce($botToken, $chatId, $full, null, null, $footerText);
     }
     return $ok;
 }
