@@ -1,8 +1,6 @@
 name: telegram-copy
-
 on:
   schedule:
-    # هر ۵ دقیقه (ریپوی Public: دقیقه‌ها رایگان است)
     - cron: '*/5 * * * *'
   workflow_dispatch:   # دکمه اجرای دستی
 
