@@ -32,7 +32,7 @@ $skipForwarded = true;
 //   'remove' = لینک و خط‌هایی که فقط لینک بوده‌اند حذف شوند، بقیه پست کپی شود
 //   'skip'   = پستی که لینک دارد اصلاً کپی نشود
 //   'keep'   = لینک‌ها دست‌نخورده بمانند
-$linkMode = 'remove';
+$linkMode = 'skip';
 
 define('LINK_MARK', "\u{E000}");
 
@@ -150,6 +150,13 @@ function applyLinkRules($text, &$hasLink) {
     global $linkMode;
     if ($linkMode === 'keep') {
         return $text;
+    }
+    // آدرس بدون http (مثل a1cable.com) هم در حالت skip لینک حساب می‌شود
+    if ($linkMode === 'skip') {
+        $domainPattern = '#(?<![\p{L}\p{N}@._-])[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|net|org|ir|info|biz|co|me|io|xyz|ly|tv|ru|app|site|online|shop)(?![\p{L}\p{N}])#iu';
+        if (preg_match($domainPattern, strip_tags($text))) {
+            $hasLink = true;
+        }
     }
     $urlPattern = '#(?:https?://|www\.|t\.me/)[^\s<]+#iu';
     if (preg_match($urlPattern, $text)) {
