@@ -33,6 +33,11 @@ $skipForwarded = true;
 //   'skip'   = پستی که لینک دارد اصلاً کپی نشود
 //   'keep'   = لینک‌ها دست‌نخورده بمانند
 $linkMode = 'skip';
+// پستی که منشن (@نام_کاربری) دارد کپی نشود
+$skipMentions = true;
+// ساخت خودکار هشتگ از کلمات مهم پست
+$addHashtags = true;
+$maxHashtags = 4;
 
 define('LINK_MARK', "\u{E000}");
 
@@ -145,6 +150,91 @@ function nodeToText($node, &$hasLink = false) {
     return $out;
 }
 
+// تولید هشتگ از کلمات مهم متن (روش آماری ساده، بدون هوش مصنوعی)
+function generateHashtags($text, $max) {
+    if ($max <= 0) {
+        return [];
+    }
+    $plain = html_entity_decode(strip_tags($text), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+    // هشتگ‌های موجود در خود پست
+    $existing = [];
+    if (preg_match_all('/#([\p{L}\p{N}_]+)/u', $plain, $m)) {
+        foreach ($m[1] as $h) {
+            $existing[mb_strtolower($h)] = true;
+        }
+    }
+    $plain = preg_replace('/#[\p{L}\p{N}_]+/u', ' ', $plain);
+    $plain = str_replace(['ي', 'ك'], ['ی', 'ک'], $plain);
+
+    $stopList = 'از به در با که را این آن برای تا یا هم های ها است بود شد شده شدند می نمی کرد کرده کردند کنند کند دارد دارند '
+        . 'بر بین پس اما ولی اگر هر همه بسیار خیلی نیز حتی تنها فقط بعد قبل روی زیر چه چند چرا کجا کی من ما شما او آنها آنان '
+        . 'ایشان خود باید شود شوند خواهد گفت گفته افزود اعلام گزارش امروز دیروز فردا سال روز ماه یک دو سه همچنین البته طبق طی '
+        . 'علیه درباره توسط همان همین چنین دیگر دیگری بیش کمتر بیشتر پیش بدون مانند مثل وی آنکه اینکه چون زیرا بلکه نیست نبود '
+        . 'هستند هست بوده بودند داشت داشته دادند داد داده میان طریق سوی جمله ضمن حال حالی عنوان کنید کنم کنیم بنابراین '
+        . 'the and for with that this from are was were has have will your you not but';
+    $stop = array_flip(explode(' ', $stopList));
+
+    $lines = preg_split('/\n+/u', trim($plain));
+    $title = $lines[0] ?? '';
+
+    $tokenize = function ($str) use ($stop, $existing) {
+        $out = [];
+        if (preg_match_all('/[\p{L}\x{200C}]+/u', $str, $mm)) {
+            foreach ($mm[0] as $w) {
+                $w = trim($w, "\u{200C}");
+                $len = mb_strlen($w);
+                if ($len < 3 || $len > 25) {
+                    continue;
+                }
+                $lw = mb_strtolower($w);
+                if (isset($stop[$lw]) || isset($existing[$lw])) {
+                    continue;
+                }
+                // فعل‌های «می‌...» و «نمی‌...»
+                if (mb_substr($w, 0, 3) === "می\u{200C}" || mb_substr($w, 0, 4) === "نمی\u{200C}") {
+                    continue;
+                }
+                $out[] = $w;
+            }
+        }
+        return $out;
+    };
+
+    $words = $tokenize($plain);
+    if (count($words) < 5) {
+        return [];
+    }
+    $inTitle = array_flip($tokenize($title));
+
+    $score = [];
+    $first = [];
+    foreach ($words as $i => $w) {
+        $score[$w] = ($score[$w] ?? 0) + 2;
+        if (!isset($first[$w])) {
+            $first[$w] = $i;
+        }
+    }
+    foreach ($score as $w => $sc) {
+        $score[$w] = $sc + (isset($inTitle[$w]) ? 3 : 0) + min(mb_strlen($w), 10) / 10;
+    }
+    uksort($score, function ($a, $b) use ($score, $first) {
+        if ($score[$a] == $score[$b]) {
+            return $first[$a] <=> $first[$b];
+        }
+        return $score[$b] <=> $score[$a];
+    });
+
+    $tags = [];
+    foreach (array_keys($score) as $w) {
+        $tags[] = '#' . str_replace("\u{200C}", '_', $w);
+        if (count($tags) >= $max) {
+            break;
+        }
+    }
+    return $tags;
+}
+
 // اعمال قانون لینک‌ها روی متن
 function applyLinkRules($text, &$hasLink) {
     global $linkMode;
@@ -216,7 +306,7 @@ function getLastTelegramPost($channelId) {
     $wrap = $wraps->item($wraps->length - 1);
 
     // پست فوروارد شده: کپی نمی‌شود
-    global $skipForwarded, $linkMode;
+    global $skipForwarded, $linkMode, $skipMentions;
     if ($skipForwarded) {
         $fw = $xp->query(".//*[contains(@class,'tgme_widget_message_forwarded_from')]", $wrap);
         if ($fw && $fw->length > 0) {
@@ -249,6 +339,10 @@ function getLastTelegramPost($channelId) {
     }
     if ($linkMode === 'skip' && $hasLink) {
         error_log("[$channelId] پست لینک دارد و نادیده گرفته شد.");
+        return null;
+    }
+    if ($skipMentions && preg_match('/@[\p{L}\p{N}_]{3,}/u', strip_tags($finalText))) {
+        error_log("[$channelId] پست منشن (@) دارد و نادیده گرفته شد.");
         return null;
     }
 
@@ -459,13 +553,23 @@ foreach ($sourceChannels as $source) {
         continue;
     }
 
+    // هشتگ‌ها (قبل از فوتر قرار می‌گیرند)
+    $footerForPost = $footerText;
+    if ($addHashtags) {
+        $tags = generateHashtags($post['text'], $maxHashtags);
+        if (!empty($tags)) {
+            $tagLine = implode(' ', $tags);
+            $footerForPost = ($footerText !== '') ? $tagLine . "\n" . $footerText : $tagLine;
+        }
+    }
+
     // جایگزینی تصویر
     $photoToSend = $post['photo'];
     $videoToSend = $post['video'];
     $localImage = getReplacementImage($replacementImageName);
     if ($localImage) {
         $replaceList = array_map('strtolower', $replacePhotoChannels);
-        $footerLen = !empty($footerText) ? mb_strlen($footerText) + 2 : 0;
+        $footerLen = !empty($footerForPost) ? mb_strlen($footerForPost) + 2 : 0;
         if ($photoToSend && !$videoToSend && in_array(strtolower($source), $replaceList, true)) {
             $photoToSend = $localImage;
             error_log("[$source] عکس پست با تصویر جایگزین عوض شد.");
@@ -480,7 +584,7 @@ foreach ($sourceChannels as $source) {
 
     $anySent = false;
     foreach ($targetChannels as $target) {
-        $sent = sendToTelegram($botToken, $target, $post['text'], $photoToSend, $videoToSend, $footerText);
+        $sent = sendToTelegram($botToken, $target, $post['text'], $photoToSend, $videoToSend, $footerForPost);
         if (!$sent) {
             error_log("خطا در ارسال پیام به کانال مقصد: @$target");
         } else {
