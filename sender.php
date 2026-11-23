@@ -276,6 +276,8 @@ function applyLinkRules($text, &$hasLink) {
 }
 
 function getLastTelegramPost($channelId) {
+    global $skipMentions, $linkMode;
+
     $url = "https://t.me/s/$channelId";
 
     $ch = curl_init();
@@ -306,14 +308,6 @@ function getLastTelegramPost($channelId) {
     $wrap = $wraps->item($wraps->length - 1);
 
     // پست فوروارد شده: کپی نمی‌شود
-    global $skipForwarded, $linkMode, $skipMentions;
-    if ($skipForwarded) {
-        $fw = $xp->query(".//*[contains(@class,'tgme_widget_message_forwarded_from')]", $wrap);
-        if ($fw && $fw->length > 0) {
-            error_log("[$channelId] پست فوروارد شده است و نادیده گرفته شد.");
-            return null;
-        }
-    }
 
     // شناسه پست
     $postId = '';
@@ -332,6 +326,29 @@ function getLastTelegramPost($channelId) {
     // متن
     $finalText = '';
     $textNode = $xp->query(".//div[contains(@class,'js-message_text')]", $wrap)->item(0);
+
+    // فیلتر منشن‌ها؛ آیدی کانال‌های مبدأ و مقصد مجاز هستند
+    global $sourceChannels, $targetChannels;
+
+    if ($skipMentions && $textNode) {
+        $allowedMentions = [];
+
+        foreach (array_merge($sourceChannels, $targetChannels) as $channel) {
+            $allowedMentions[] = mb_strtolower('@' . ltrim(trim($channel), '@'));
+        }
+
+        $rawText = $textNode->textContent;
+
+        if (preg_match_all('/(?<![\p{L}\p{N}_])@[\p{L}\p{N}_]{3,}/u', $rawText, $matches)) {
+            foreach (array_unique($matches[0]) as $mention) {
+                if (!in_array(mb_strtolower($mention), $allowedMentions, true)) {
+                    error_log("[$channelId] پست به دلیل وجود منشن $mention نادیده گرفته شد.");
+                    return null;
+                }
+            }
+        }
+    }
+
     $hasLink = false;
     if ($textNode) {
         $finalText = nodeToText($textNode, $hasLink);
@@ -341,11 +358,6 @@ function getLastTelegramPost($channelId) {
         error_log("[$channelId] پست لینک دارد و نادیده گرفته شد.");
         return null;
     }
-    if ($skipMentions && preg_match('/@[\p{L}\p{N}_]{3,}/u', strip_tags($finalText))) {
-        error_log("[$channelId] پست منشن (@) دارد و نادیده گرفته شد.");
-        return null;
-    }
-
     // عکس: فقط از تگ عکس خود پست
     $photoUrl = null;
     $photoNode = $xp->query(".//a[contains(@class,'tgme_widget_message_photo_wrap')]", $wrap)->item(0);
