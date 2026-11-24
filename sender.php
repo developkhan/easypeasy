@@ -19,6 +19,12 @@ $footerText = $config['footer_text'] ?? '';
 $sourceChannels = array_values(array_unique($sourceChannels));
 $targetChannels = array_values(array_unique($targetChannels));
 
+// آیدی کانال‌های خودمان (مبدأ و مقصد): منشن و لینک به این‌ها تبلیغ حساب نمی‌شود
+$allowedHandles = [];
+foreach (array_merge($sourceChannels, $targetChannels) as $c) {
+    $allowedHandles[strtolower(ltrim($c, '@'))] = true;
+}
+
 // ===== تنظیمات =====
 // نام فایل تصویر جایگزین (در ریپو، کنار sender.php)
 $replacementImageName = 'banner.png';
@@ -124,6 +130,10 @@ function nodeToText($node, &$hasLink = false) {
         // لینک‌ها
         if ($name === 'a') {
             $href = $child->getAttribute('href');
+            if (isOwnChannelUrl($href)) {
+                $out .= LINK_MARK;
+                continue;
+            }
             $plain = trim($child->textContent);
             $isTagOrMention = ($href === '' || $href[0] === '?' || $href[0] === '#' || mb_substr($plain, 0, 1) === '@');
             if ($isTagOrMention || $linkMode === 'keep') {
@@ -240,28 +250,19 @@ function generateHashtags($text, $max) {
     return $tags;
 }
 
-// اعمال قانون لینک‌ها روی متن
-function applyLinkRules($text, &$hasLink) {
-    global $linkMode;
-    if ($linkMode === 'keep') {
-        return $text;
+// آیا این آدرس به یکی از کانال‌های خودمان (مبدأ یا مقصد) اشاره دارد؟
+function isOwnChannelUrl($url) {
+    global $allowedHandles;
+    $url = html_entity_decode(trim($url), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    if (preg_match('~^(?:https?://)?(?:t\.me|telegram\.me)/(?:s/)?@?([A-Za-z0-9_]+)~i', $url, $m)) {
+        return isset($allowedHandles[strtolower($m[1])]);
     }
-    // آدرس بدون http (مثل a1cable.com) هم در حالت skip لینک حساب می‌شود
-    if ($linkMode === 'skip') {
-        $domainPattern = '#(?<![\p{L}\p{N}@._-])[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|net|org|ir|info|biz|co|me|io|xyz|ly|tv|ru|app|site|online|shop)(?![\p{L}\p{N}])#iu';
-        if (preg_match($domainPattern, strip_tags($text))) {
-            $hasLink = true;
-        }
-    }
-    $urlPattern = '#(?:https?://|www\.|t\.me/)[^\s<]+#iu';
-    if (preg_match($urlPattern, $text)) {
-        if ($linkMode === 'skip') {
-            $hasLink = true;
-        } else {
-            $text = preg_replace($urlPattern, LINK_MARK, $text);
-        }
-    }
-    if ($linkMode !== 'remove') {
+    return false;
+}
+
+// خط‌هایی که نشانه (منشن/لینک کانال خودمان) دارند: اگر چیز مهمی در آن‌ها نمانده حذف می‌شوند
+function cleanLinkMarks($text) {
+    if (strpos($text, LINK_MARK) === false) {
         return $text;
     }
     $result = [];
@@ -273,11 +274,44 @@ function applyLinkRules($text, &$hasLink) {
         $rest = str_replace(LINK_MARK, '', $line);
         $letters = preg_replace('/[^\p{L}\p{N}]+/u', '', strip_tags($rest));
         if (mb_strlen($letters) <= 30) {
-            continue; // خط عملاً فقط لینک (یا دعوت به لینک) بوده
+            continue; // خط عملاً فقط امضا یا لینک بوده
         }
         $result[] = rtrim($rest);
     }
     return implode("\n", $result);
+}
+
+// اعمال قانون لینک‌ها روی متن
+function applyLinkRules($text, &$hasLink) {
+    global $linkMode, $allowedHandles;
+
+    // منشن کانال‌های خودمان: حذف می‌شود (تبلیغ حساب نمی‌شود)
+    $text = preg_replace_callback('/@([A-Za-z0-9_]{3,})/', function ($m) use ($allowedHandles) {
+        return isset($allowedHandles[strtolower($m[1])]) ? LINK_MARK : $m[0];
+    }, $text);
+
+    if ($linkMode !== 'keep') {
+        $urlPattern = '#(?:https?://|www\.|t\.me/)[^\s<]+#iu';
+        $text = preg_replace_callback($urlPattern, function ($m) use (&$hasLink, $linkMode) {
+            if (isOwnChannelUrl($m[0])) {
+                return LINK_MARK;
+            }
+            if ($linkMode === 'skip') {
+                $hasLink = true;
+                return $m[0];
+            }
+            return LINK_MARK;
+        }, $text);
+
+        // آدرس بدون http (مثل a1cable.com) هم در حالت skip لینک حساب می‌شود
+        if ($linkMode === 'skip') {
+            $domainPattern = '#(?<![\p{L}\p{N}@._-])[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|net|org|ir|info|biz|co|me|io|xyz|ly|tv|ru|app|site|online|shop)(?![\p{L}\p{N}])#iu';
+            if (preg_match($domainPattern, strip_tags($text))) {
+                $hasLink = true;
+            }
+        }
+    }
+    return cleanLinkMarks($text);
 }
 
 function getLastTelegramPost($channelId) {
@@ -311,7 +345,7 @@ function getLastTelegramPost($channelId) {
     $wrap = $wraps->item($wraps->length - 1);
 
     // پست فوروارد شده: کپی نمی‌شود
-    global $skipForwarded, $linkMode, $skipMentions;
+    global $skipForwarded, $linkMode, $skipMentions, $allowedHandles;
     if ($skipForwarded) {
         $fw = $xp->query(".//*[contains(@class,'tgme_widget_message_forwarded_from')]", $wrap);
         if ($fw && $fw->length > 0) {
@@ -346,9 +380,13 @@ function getLastTelegramPost($channelId) {
         error_log("[$channelId] پست لینک دارد و نادیده گرفته شد.");
         return null;
     }
-    if ($skipMentions && preg_match('/@[\p{L}\p{N}_]{3,}/u', strip_tags($finalText))) {
-        error_log("[$channelId] پست منشن (@) دارد و نادیده گرفته شد.");
-        return null;
+    if ($skipMentions && preg_match_all('/@([A-Za-z0-9_]{3,})/', strip_tags($finalText), $mentionMatches)) {
+        foreach ($mentionMatches[1] as $handle) {
+            if (!isset($allowedHandles[strtolower($handle)])) {
+                error_log("[$channelId] پست منشن یک آیدی دیگر (@$handle) دارد و نادیده گرفته شد.");
+                return null;
+            }
+        }
     }
 
     // عکس: فقط از تگ عکس خود پست
