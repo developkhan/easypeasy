@@ -47,6 +47,11 @@ if (file_exists($sentFile)) {
     $sentMessages = json_decode(file_get_contents($sentFile), true) ?: [];
 }
 
+// نمایش خطا در صفحه خلاصه اجرای GitHub Actions (بدون قرمزکردن کل اجرا)
+function ghError($msg) {
+    echo "::error::" . str_replace(["\r", "\n"], ' ', $msg) . "\n";
+}
+
 // پیدا کردن فایل تصویر جایگزین در ریپو
 function getReplacementImage($name) {
     if ($name !== '') {
@@ -182,7 +187,7 @@ function generateHashtags($text, $max) {
         $out = [];
         if (preg_match_all('/[\p{L}\x{200C}]+/u', $str, $mm)) {
             foreach ($mm[0] as $w) {
-                $w = trim($w, "\u{200C}");
+                $w = preg_replace('/^\x{200C}+|\x{200C}+$/u', '', $w);
                 $len = mb_strlen($w);
                 if ($len < 3 || $len > 25) {
                     continue;
@@ -463,7 +468,8 @@ function sendToTelegram($botToken, $chatId, $text, $photo = null, $video = null,
 }
 
 function sendOnce($botToken, $chatId, $text, $photo = null, $video = null, $footerText = '') {
-    $text = cleanText($text);
+    $text = mb_scrub(cleanText($text), 'UTF-8');
+    $footerText = mb_scrub($footerText, 'UTF-8');
 
     if (!empty($footerText)) {
         $footer = htmlspecialchars($footerText, ENT_NOQUOTES, 'UTF-8');
@@ -529,6 +535,7 @@ function sendOnce($botToken, $chatId, $text, $photo = null, $video = null, $foot
     $res = json_decode($response, true);
     if (!$res || empty($res['ok'])) {
         error_log('Telegram API error: ' . $response);
+        ghError('Telegram API error: ' . $response);
     }
     return $res && isset($res['ok']) && $res['ok'] === true;
 }
@@ -556,7 +563,15 @@ foreach ($sourceChannels as $source) {
     // هشتگ‌ها (قبل از فوتر قرار می‌گیرند)
     $footerForPost = $footerText;
     if ($addHashtags) {
-        $tags = generateHashtags($post['text'], $maxHashtags);
+        try {
+            $tags = generateHashtags($post['text'], $maxHashtags);
+        } catch (Throwable $e) {
+            error_log('خطا در تولید هشتگ: ' . $e->getMessage());
+            $tags = [];
+        }
+        $tags = array_values(array_filter($tags, function ($t) {
+            return mb_check_encoding($t, 'UTF-8');
+        }));
         if (!empty($tags)) {
             $tagLine = implode(' ', $tags);
             $footerForPost = ($footerText !== '') ? $tagLine . "\n" . $footerText : $tagLine;
@@ -587,6 +602,7 @@ foreach ($sourceChannels as $source) {
         $sent = sendToTelegram($botToken, $target, $post['text'], $photoToSend, $videoToSend, $footerForPost);
         if (!$sent) {
             error_log("خطا در ارسال پیام به کانال مقصد: @$target");
+            ghError("ارسال به کانال مقصد ناموفق بود: @$target");
         } else {
             $anySent = true;
         }
@@ -599,5 +615,6 @@ foreach ($sourceChannels as $source) {
 }
 
 if ($updated) {
+    $sentMessages = array_slice($sentMessages, -500);
     file_put_contents($sentFile, json_encode($sentMessages, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 }
