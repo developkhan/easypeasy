@@ -19,10 +19,10 @@ $footerText = $config['footer_text'] ?? '';
 $sourceChannels = array_values(array_unique($sourceChannels));
 $targetChannels = array_values(array_unique($targetChannels));
 
-// آیدی کانال‌های خودمان (مبدأ و مقصد): منشن و لینک به این‌ها تبلیغ حساب نمی‌شود
-$allowedHandles = [];
-foreach (array_merge($sourceChannels, $targetChannels) as $c) {
-    $allowedHandles[strtolower(ltrim($c, '@'))] = true;
+foreach ($sourceChannels as $c) {
+    if (in_array(strtolower(ltrim($c, '@')), array_map('strtolower', $targetChannels), true)) {
+        echo "::warning::یک کانال هم در مبدأ و هم در مقصد ثبت شده است: بررسی کن (کپی از یک کانال به خودش).\n";
+    }
 }
 
 // ===== تنظیمات =====
@@ -44,6 +44,21 @@ $skipMentions = true;
 // ساخت خودکار هشتگ از کلمات مهم پست
 $addHashtags = true;
 $maxHashtags = 4;
+// آیدی‌های اضافه‌ای که تبلیغ حساب نمی‌شوند (حروف کوچک، بدون @).
+// منشن این‌ها از متن حذف می‌شود ولی پست کپی می‌شود. اگر نمی‌خواهی، مقدار را [] کن.
+$extraAllowedHandles = ['akhbartelfori'];
+// فوتر پیش‌فرض: اگر Secret به نام FOOTER_TEXT خالی بود، این متن زیر پست‌ها می‌آید
+$defaultFooter = '@telkhabarfori';
+
+if (trim($footerText) === '') {
+    $footerText = $defaultFooter;
+}
+
+// آیدی کانال‌های خودمان (مبدأ و مقصد) + آیدی‌های مجاز اضافه: تبلیغ حساب نمی‌شوند
+$allowedHandles = [];
+foreach (array_merge($sourceChannels, $targetChannels, $extraAllowedHandles) as $c) {
+    $allowedHandles[strtolower(ltrim($c, '@'))] = true;
+}
 
 define('LINK_MARK', "\u{E000}");
 
@@ -56,6 +71,17 @@ if (file_exists($sentFile)) {
 // نمایش خطا در صفحه خلاصه اجرای GitHub Actions (بدون قرمزکردن کل اجرا)
 function ghError($msg) {
     echo "::error::" . str_replace(["\r", "\n"], ' ', $msg) . "\n";
+}
+
+// پیام اطلاع‌رسانی (آبی) در صفحه خلاصه اجرا
+function ghNotice($msg) {
+    echo "::notice::" . str_replace(["\r", "\n"], ' ', $msg) . "\n";
+}
+
+// ثبت دلیل نادیده‌گرفتن یک پست، هم در لاگ و هم در خلاصه اجرا
+function logSkip($msg) {
+    error_log($msg);
+    ghNotice($msg);
 }
 
 // پیدا کردن فایل تصویر جایگزین در ریپو
@@ -349,7 +375,7 @@ function getLastTelegramPost($channelId) {
     if ($skipForwarded) {
         $fw = $xp->query(".//*[contains(@class,'tgme_widget_message_forwarded_from')]", $wrap);
         if ($fw && $fw->length > 0) {
-            error_log("[$channelId] پست فوروارد شده است و نادیده گرفته شد.");
+            logSkip("[$channelId] پست فوروارد شده است و نادیده گرفته شد.");
             return null;
         }
     }
@@ -377,13 +403,13 @@ function getLastTelegramPost($channelId) {
         $finalText = applyLinkRules($finalText, $hasLink);
     }
     if ($linkMode === 'skip' && $hasLink) {
-        error_log("[$channelId] پست لینک دارد و نادیده گرفته شد.");
+        logSkip("[$channelId] پست لینک دارد و نادیده گرفته شد.");
         return null;
     }
     if ($skipMentions && preg_match_all('/@([A-Za-z0-9_]{3,})/', strip_tags($finalText), $mentionMatches)) {
         foreach ($mentionMatches[1] as $handle) {
             if (!isset($allowedHandles[strtolower($handle)])) {
-                error_log("[$channelId] پست منشن یک آیدی دیگر (@$handle) دارد و نادیده گرفته شد.");
+                logSkip("[$channelId] پست منشن یک آیدی دیگر (@$handle) دارد و نادیده گرفته شد.");
                 return null;
             }
         }
@@ -588,7 +614,7 @@ foreach ($sourceChannels as $source) {
     }
 
     if ($post['text'] === '' && empty($post['photo']) && empty($post['video'])) {
-        error_log("[$source] پست بدون متن و رسانه، نادیده گرفته شد.");
+        logSkip("[$source] پست بدون متن و رسانه، نادیده گرفته شد.");
         continue;
     }
 
@@ -649,6 +675,7 @@ foreach ($sourceChannels as $source) {
     if ($anySent) {
         $sentMessages[] = $messageId;
         $updated = true;
+        ghNotice("[$source] پست جدید کپی و ارسال شد.");
     }
 }
 
